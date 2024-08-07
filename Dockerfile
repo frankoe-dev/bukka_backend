@@ -26,7 +26,7 @@ COPY app.env .
 # COPY app.env /app
 
 # Expose the port
-EXPOSE 7001 6000
+EXPOSE 7001 8080
 
 # Run the executable
 CMD ["/app/main"]

@@ -38,7 +38,7 @@ type AccessTokenResult struct {
 
 func CheckUserExists(ctx context.Context, qtx *sqlc.Queries, email, username string) error {
 	// Check db if email exists
-	if err := checkEmailExistsError(ctx, qtx, email); err != nil {
+	if err := CheckEmailExistsError(ctx, qtx, email); err != nil {
 		fmt.Println("Error checking email", email)
 		return err
 	}
@@ -66,12 +66,20 @@ func PrepareUserData(pwd string) (string, uuid.UUID, error) {
 	return hashedPwd, uid, nil
 }
 
-func CreateUserConcurrent(ctx context.Context, qtx *sqlc.Queries /*tx *sql.Tx,*/, uid uuid.UUID, email, username, pwd string) (sqlc.Authentication, error) {
+func CreateUserConcurrent(ctx context.Context, qtx *sqlc.Queries /*tx *sql.Tx,*/, uid uuid.UUID, email, username, pwd string, isEmailVerified, isOauthUser bool) (sqlc.Authentication, error) {
 	params := sqlc.CreateUserParams{
 		ID:           uid,
 		Email:        email,
 		Username:     sql.NullString{String: username, Valid: true},
 		PasswordHash: pwd,
+		IsEmailVerified: sql.NullBool{
+			Bool:  isEmailVerified,
+			Valid: true,
+		},
+		IsOauthUser: sql.NullBool{
+			Bool:  isOauthUser,
+			Valid: true,
+		},
 	}
 
 	userData, err := qtx.CreateUser(ctx, params)
@@ -88,6 +96,144 @@ func CreateUserConcurrent(ctx context.Context, qtx *sqlc.Queries /*tx *sql.Tx,*/
 	}, nil
 }
 
+func RunConcurrentUserCreationTasks(ctx context.Context, tokenMaker token.Maker, qtx *sqlc.Queries, tx *sql.Tx, config utils.Config, td worker.TaskDistributor,
+	req RegisterReq, uid uuid.UUID, clientIP string, agent string, isEmailVerified bool) (string, time.Time, error) {
+
+	var accessToken string
+	var accessPayload *token.Payload
+	var err error
+
+	var eg errgroup.Group
+
+	// Create access token
+	eg.Go(func() error {
+		accessToken, accessPayload, err = tokenMaker.CreateToken(
+			token.PayloadData{
+				Role:          constants.RegularUsers,
+				Subject:       uid,
+				Username:      req.Username,
+				Email:         req.Email,
+				EmailVerified: false,
+				Issuer:        config.AppName,
+				Audience:      "website users",
+				IP:            clientIP,
+				UserAgent:     agent,
+				MfaPassed:     true,
+				TokenType:     token.TokenType(token.AccessToken),
+			}, config.AccessTokenDuration, token.TokenType(token.AccessToken),
+		)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	// Create user profile
+	eg.Go(func() error {
+		err = qtx.CreateUserProfile(ctx, sqlc.CreateUserProfileParams{
+			UserID:    uid,
+			FirstName: sql.NullString{String: req.FullName, Valid: true},
+			LastName:  sql.NullString{String: req.FullName, Valid: true},
+		})
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	// Create user role
+	eg.Go(func() error {
+		_, err = qtx.CreateUserRole(ctx, sqlc.CreateUserRoleParams{
+			UserID: uid,
+			RoleID: constants.RegularUsers,
+		})
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	// Send verification email concurrently (does not need to be within transaction)
+	if !isEmailVerified {
+
+		eg.Go(func() error {
+			err = SendVerificationEmail(qtx, ctx, td, uid, req.Email)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		})
+	}
+
+	// Wait for both goroutines to complete
+	if err := eg.Wait(); err != nil {
+		tx.Rollback()
+		return "", time.Time{}, errors.New("error registering " + err.Error())
+	}
+
+	return accessToken, accessPayload.Expires, nil
+}
+
+// ?----------------
+func CheckEmailExistsError(ctx context.Context, qtx *sqlc.Queries, email string) error {
+	// Check duplicate emails
+	user, err := qtx.GetUserByIdentifier(ctx, email)
+	if err != nil && err != sql.ErrNoRows {
+		// An error occurred that isn't simply indicating no rows were found
+		return err
+	}
+
+	if user.ID != uuid.Nil {
+		// User exists, check if the account is marked as deleted
+		if user.DeletedAt.Valid {
+			// Check if the account is within the recovery period
+			if time.Since(user.DeletedAt.Time) <= MaxAccountRecoveryDuration {
+				// Account is within the recovery period and can be recovered
+				return errors.New("account is deleted but can be recovered, please follow the account recovery process")
+			} else {
+				// Account is beyond the recovery period, append timestamp to the email to make it unique
+				err = appendTimestampToEmail(ctx, qtx, user.Email, user.DeletedAt.Time)
+				if err != nil {
+					return fmt.Errorf("failed to update email for user with ID %s: %v", user.ID, err)
+				}
+			}
+		} else {
+			// Account exists and is not marked as deleted
+			return errors.New("email already exists")
+		}
+	}
+	return nil
+}
+
+// Placeholder store method to append a timestamp to the user's email
+func appendTimestampToEmail(ctx context.Context, qtx *sqlc.Queries, email string, deletedAt time.Time) error {
+	// Implement the logic to append a timestamp to the user's email.
+	// This will involve updating the user record in the database.
+	// Be careful to ensure that the new email remains unique and valid.
+	// For example, you might append something like "_deleted_1612385610" to the email.
+	newEmail := addDeleteTimeToEmail(email, deletedAt)
+
+	_, err := qtx.UpdateUser(ctx, sqlc.UpdateUserParams{
+		Email: sql.NullString{String: newEmail, Valid: true},
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func addDeleteTimeToEmail(email string, deletedAt time.Time) string {
+	timestamp := deletedAt.Unix() // Convert time to Unix timestamp
+	modifiedEmail := fmt.Sprintf("%s_deleted_%d", email, timestamp)
+	return modifiedEmail
+}
+
+/*
 func RunSyncUserCreationTasks(ctx context.Context, qtx *sqlc.Queries, tx *sql.Tx, config utils.Config, td worker.TaskDistributor,
 	req RegisterReq, uid uuid.UUID, clientIP string, agent string) (string, time.Time, error) {
 
@@ -95,7 +241,7 @@ func RunSyncUserCreationTasks(ctx context.Context, qtx *sqlc.Queries, tx *sql.Tx
 		err error
 	}
 
-	tokenService := NewTokenService(config)
+	tokenService := NewTokenService(config, cache.NewCache(config.RedisAddress, config.RedisUsername, config.RedisPwd, 0))
 
 	// Create access token
 	accessToken, accessPayload, err := tokenService.CreateAccessToken(req.Email, req.Username, "", true, false, uid, constants.RegularUsers, clientIP, agent)
@@ -160,124 +306,4 @@ func RunSyncUserCreationTasks(ctx context.Context, qtx *sqlc.Queries, tx *sql.Tx
 
 	return accessToken, accessPayload.Expires, nil
 }
-
-func RunConcurrentUserCreationTasks(ctx context.Context, qtx *sqlc.Queries, tx *sql.Tx, config utils.Config, td worker.TaskDistributor,
-	req RegisterReq, uid uuid.UUID, clientIP string, agent string) (string, time.Time, error) {
-
-	tokenService := NewTokenService(config)
-	var accessToken string
-	var accessPayload *token.Payload
-	var err error
-
-	var eg errgroup.Group
-
-	// Create access token
-	eg.Go(func() error {
-		accessToken, accessPayload, err = tokenService.CreateAccessToken(req.Email, req.Username, "", true, false, uid, constants.RegularUsers, clientIP, agent)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-
-	// Create user profile
-	eg.Go(func() error {
-		err = qtx.CreateUserProfile(ctx, sqlc.CreateUserProfileParams{
-			UserID:    uid,
-			FirstName: sql.NullString{String: req.FullName, Valid: true},
-			LastName:  sql.NullString{String: req.FullName, Valid: true},
-		})
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-
-	// Create user role
-	eg.Go(func() error {
-		_, err = qtx.CreateUserRole(ctx, sqlc.CreateUserRoleParams{
-			UserID: uid,
-			RoleID: constants.RegularUsers,
-		})
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-
-	// Send verification email concurrently (does not need to be within transaction)
-	eg.Go(func() error {
-		err = SendVerificationEmail(qtx, ctx, td, uid, req.Email)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-
-	// Wait for both goroutines to complete
-	if err := eg.Wait(); err != nil {
-		tx.Rollback()
-		return "", time.Time{}, errors.New("error registering " + err.Error())
-	}
-
-	return accessToken, accessPayload.Expires, nil
-}
-
-// ?----------------
-func checkEmailExistsError(ctx context.Context, qtx *sqlc.Queries, email string) error {
-	// Check duplicate emails
-	user, err := qtx.GetUserByIdentifier(ctx, email)
-	if err != nil && err != sql.ErrNoRows {
-		// An error occurred that isn't simply indicating no rows were found
-		return err
-	}
-
-	if user.ID != uuid.Nil {
-		// User exists, check if the account is marked as deleted
-		if user.DeletedAt.Valid {
-			// Check if the account is within the recovery period
-			if time.Since(user.DeletedAt.Time) <= MaxAccountRecoveryDuration {
-				// Account is within the recovery period and can be recovered
-				return errors.New("account is deleted but can be recovered, please follow the account recovery process")
-			} else {
-				// Account is beyond the recovery period, append timestamp to the email to make it unique
-				err = appendTimestampToEmail(ctx, qtx, user.Email, user.DeletedAt.Time)
-				if err != nil {
-					return fmt.Errorf("failed to update email for user with ID %s: %v", user.ID, err)
-				}
-			}
-		} else {
-			// Account exists and is not marked as deleted
-			return errors.New("email already exists")
-		}
-	}
-	return nil
-}
-
-// Placeholder store method to append a timestamp to the user's email
-func appendTimestampToEmail(ctx context.Context, qtx *sqlc.Queries, email string, deletedAt time.Time) error {
-	// Implement the logic to append a timestamp to the user's email.
-	// This will involve updating the user record in the database.
-	// Be careful to ensure that the new email remains unique and valid.
-	// For example, you might append something like "_deleted_1612385610" to the email.
-	newEmail := addDeleteTimeToEmail(email, deletedAt)
-
-	_, err := qtx.UpdateUser(ctx, sqlc.UpdateUserParams{
-		Email: sql.NullString{String: newEmail, Valid: true},
-	})
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func addDeleteTimeToEmail(email string, deletedAt time.Time) string {
-	timestamp := deletedAt.Unix() // Convert time to Unix timestamp
-	modifiedEmail := fmt.Sprintf("%s_deleted_%d", email, timestamp)
-	return modifiedEmail
-}
+*/

@@ -35,14 +35,7 @@ type ResetPwdReq struct {
 	NewPassword string `json:"new_password" binding:"required,passwordValidator"`
 }
 
-// Responses
-type AuthTokenResp struct {
-	AccessToken           string    `json:"access_token"`
-	AccessTokenExpiresAt  time.Time `json:"access_token_expires_at"`
-	RefreshToken          string    `json:"refresh_token"`
-	RefreshTokenExpiresAt time.Time `json:"refresh_token_expires_at"`
-}
-
+// ! Responses
 type UserAuthRes struct {
 	Uid               uuid.UUID `json:"uid"`
 	IsEmailVerified   bool      `json:"is_email_verified"`
@@ -54,7 +47,7 @@ type UserAuthRes struct {
 	IsMfaEnabled      bool      `json:"is_mfa_enabled"`
 	IsDeleted         bool      `json:"is_deleted"`
 	ImageUrl          string    `json:"image_url"`
-	AuthTokenResp
+	AuthToken
 }
 
 type VerifyEmailRes struct {
@@ -64,4 +57,20 @@ type VerifyEmailRes struct {
 
 type GenericRes struct {
 	Msg string `json:"msg"`
+}
+
+type HomeRes struct {
+	Msg string `json:"msg"`
+}
+
+type UserProfileRes struct {
+	Uid        string    `json:"uid"`
+	Username   string    `json:"username"`
+	Email      string    `json:"email"`
+	Phone      string    `json:"phone"`
+	FirstName  string    `json:"first_name"`
+	LastName   string    `json:"last_name"`
+	ImageUrl   string    `json:"image_url"`
+	CreatedAt  time.Time `json:"created_at"`
+	IsVerified bool      `json:"is_verified"`
 }
